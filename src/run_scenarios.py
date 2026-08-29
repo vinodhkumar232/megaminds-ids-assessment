@@ -1,130 +1,152 @@
-import pandas as pd
-import numpy as np
-import joblib
-import time
 import os
+import time
+import joblib
+import numpy as np
+import pandas as pd
+from collections import deque
 
-# ── CONFIGURATION & PATHS ────────────────────────────────────────
-MODEL_PATH = "E:/megaminds-ids-assessment/models/attack_classifier.pkl"
-ENCODER_PATH = "E:/megaminds-ids-assessment/models/label_encoder.pkl"
-DATA_DIR = "E:/megaminds-ids-assessment/datasets/MachineLearningCVE/"
+# ── CONFIGURATION & RELATIVE PATHS ──────────────────────────────
+MODEL_PATH = "models/attack_classifier.pkl"
+ENCODER_PATH = "models/label_encoder.pkl"
+DATA_DIR = "datasets/MachineLearningCVE"
 
-# Updated to match the exact 14 features your pre-trained model expects
+# 14 synchronized features
 FEATURES = [
-    "Destination Port", "Flow Duration", "Total Fwd Packets", 
-    "Total Backward Packets", "Total Length of Fwd Packets", 
-    "Total Length of Bwd Packets", "Flow Bytes/s", "Flow Packets/s", 
-    "Packet Length Mean", "Average Packet Size", "SYN Flag Count", 
-    "ACK Flag Count", "PSH Flag Count", "RST Flag Count"
+    "Destination Port", "Flow Duration", "Total Fwd Packets",
+    "Total Backward Packets", "Total Length of Fwd Packets",
+    "Total Length of Bwd Packets", "Flow Bytes/s", "Flow Packets/s",
+    "Packet Length Mean", "Average Packet Size", "SYN Flag Count",
+    "ACK Flag Count", "PSH Flag Count", "RST Flag Count",
 ]
 
 # ── MODEL LOADING ────────────────────────────────────────────────
-print("[*] Booting AI-Driven Intrusion Detection System...")
-if not os.path.exists(MODEL_PATH):
-    print(f"[!] ERROR: Model not found at {MODEL_PATH}")
+print("[*] Initializing AI-Driven Intrusion Detection Pipeline...")
+if not os.path.exists(MODEL_PATH) or not os.path.exists(ENCODER_PATH):
+    print(f"[!] ERROR: Model artifacts not found in 'models/'.")
+    print("    Please run 'python src/classifier.py' first.")
     exit(1)
 
 clf = joblib.load(MODEL_PATH)
 le = joblib.load(ENCODER_PATH)
 
-# ── HELPER FUNCTIONS ─────────────────────────────────────────────
-def get_traffic_sample(filename, target_label):
-    """Memory-efficient function to find a specific attack row without loading the whole CSV."""
+# ── CORE SIMULATION LOGIC ────────────────────────────────────────
+def simulate_attack_campaign(filename: str, target_label: str, batch_size: int = 25):
+    """
+    Streams network traffic, buffers a baseline, and processes a sustained batch 
+    of flows to detect and explain an attack campaign.
+    """
+    print(f"\n{'=' * 60}")
+    print(f"SCENARIO: {target_label.upper()} CAMPAIGN DETECTION")
+    print(f"{'=' * 60}")
+
     filepath = os.path.join(DATA_DIR, filename)
-    print(f"    [>] Scanning {filename} for {target_label} traffic...")
-    
+    if not os.path.exists(filepath):
+        print(f"[-] Error: File not found: {filepath}")
+        return
+
+    print(f"[*] Scanning {filename} for {target_label} campaign...")
+
+    # Rolling buffer to capture the 5 benign flows immediately preceding the attack
+    history = deque(maxlen=5)
+    campaign_batch = []
+    found_attack = False
+
     try:
-        # Read in chunks of 50,000 rows to prevent RAM crashes
+        # Read in chunks to prevent Out-of-Memory (OOM) crashes
         for chunk in pd.read_csv(filepath, chunksize=50000, low_memory=False, encoding="latin-1"):
             chunk.columns = chunk.columns.str.strip()
             chunk.replace([np.inf, -np.inf], 0, inplace=True)
             chunk.fillna(0, inplace=True)
-            
-            # Find the first row that matches our target label
-            match = chunk[chunk['Label'].astype(str).str.strip() == target_label]
-            if not match.empty:
-                return match.iloc[0].to_dict()
-    except Exception as e:
-        print(f"    [!] Error reading file: {e}")
-    
-    return None
 
-def analyze_traffic(row_data, scenario_name):
-    """Runs the ML model and outputs explainable results."""
-    print(f"\n{'='*60}\n{scenario_name}\n{'='*60}")
-    time.sleep(1) # Artificial delay for video presentation effect
-    
-    if not row_data:
-        print("\033[91m[!] Error: Could not find traffic sample in dataset.\033[0m")
+            for _, row in chunk.iterrows():
+                current_label = str(row.get("Label", "")).strip()
+
+                if not found_attack:
+                    if current_label == target_label:
+                        found_attack = True
+                        # Flush the baseline history into our batch
+                        campaign_batch.extend(list(history))
+                        campaign_batch.append(row)
+                    else:
+                        history.append(row)
+                else:
+                    campaign_batch.append(row)
+                    if len(campaign_batch) >= batch_size:
+                        break # Batch filled
+
+            if len(campaign_batch) >= batch_size:
+                break
+
+    except Exception as e:
+        print(f"[-] Error parsing {filename}: {e}")
         return
 
-    # Extract exactly the 14 features the model needs
-    feature_vector = []
-    for f in FEATURES:
-        # Using a slight fuzziness to catch column name inconsistencies in the CSV
-        val = row_data.get(f, row_data.get(f.strip(), 0))
-        feature_vector.append(float(val))
-    
-    # Run Inference
-    pred_idx = clf.predict([feature_vector])[0]
-    probabilities = clf.predict_proba([feature_vector])[0]
-    
-    confidence = probabilities[pred_idx] * 100
-    label = le.inverse_transform([pred_idx])[0]
-    
-    # ── EXPLAINABILITY ENGINE (Fulfills Rubric Section 3D) ──
-    # Indices updated for 14-feature array: 
-    # [1]=Flow Duration, [6]=Flow Bytes/s, [7]=Flow Packets/s, [8]=Packet Length Mean
-    print(f"[*] Analyzing Flow: Duration={feature_vector[1]}us, Bytes/s={feature_vector[6]:.2f}")
+    if not found_attack or len(campaign_batch) == 0:
+        print(f"[-] Error: Could not find '{target_label}' traffic in this file.")
+        return
+
+    print(f"[*] Ingesting network interface stream ({len(campaign_batch)} sequential flows)...\n")
     time.sleep(1)
-    
-    if label == "BENIGN":
-        print("\033[92m[+] STATUS: NORMAL TRAFFIC (BENIGN)\033[0m")
-        print(f"    Confidence: {confidence:.2f}%")
-        print("    Reason: All flow metrics (packet size, frequency, duration) are within normal baseline thresholds.")
-    else:
-        print("\033[91m[!] ALERT: ANOMALOUS BEHAVIOR DETECTED\033[0m")
-        print(f"    Threat Classification: {label}")
-        print(f"    Confidence/Severity: {confidence:.2f}%")
-        
-        # Explain *why* the model flagged it based on feature behavior
-        if feature_vector[7] > 1000:
-            reason = f"Anomalous spike in connection frequency ({feature_vector[7]:.0f} Packets/sec). Signature of flooding or scanning."
-        elif feature_vector[8] > 500:
-            reason = f"Abnormal mean packet length ({feature_vector[8]:.0f} bytes). Signature of payload delivery or exfiltration."
-        elif feature_vector[1] > 5000000 and feature_vector[6] < 1000:
-            reason = "Long flow duration with extremely low byte rate. Signature of 'low and slow' attacks or beacons."
+
+    threat_count = 0
+    malicious_flows = []
+
+    # Process the stream flow-by-flow
+    for i, row in enumerate(campaign_batch):
+        # Extract features safely
+        feature_vector = []
+        for f in FEATURES:
+            val = row.get(f, row.get(f.strip(), 0.0))
+            try:
+                val = float(val)
+            except (ValueError, TypeError):
+                val = 0.0
+            feature_vector.append(val)
+
+        # Package as DataFrame to silence scikit-learn warnings
+        feature_df = pd.DataFrame([feature_vector], columns=FEATURES)
+        pred_idx = clf.predict(feature_df)[0]
+        pred_label = le.inverse_transform([pred_idx])[0]
+
+        time.sleep(0.05)  # Fast visual CLI effect
+
+        if pred_label == 'BENIGN':
+            print(f"  [+] Flow {i+1:02d}: OK (Benign)")
         else:
-            reason = "Statistical deviation from benign traffic baselines across multiple flow features."
-            
-        print(f"    Reason: {reason}")
-    print(f"    Ground Truth Label (from dataset): {row_data.get('Label')}")
+            print(f"  \033[91m[!] Flow {i+1:02d}: {pred_label} signature detected\033[0m")
+            threat_count += 1
+            malicious_flows.append(feature_vector)
 
-# ── EXECUTE MANDATORY SCENARIOS ──────────────────────────────────
+    # Campaign Alerting & ML Explainability
+    print(f"\n{'='*60}")
+    if threat_count > (len(campaign_batch) * 0.3): # 30% anomaly threshold
+        print(f"\033[91m[!!!] CRITICAL ALERT: SUSTAINED {target_label.upper()} CAMPAIGN DETECTED\033[0m")
+        print(f"[*] Volume: {threat_count}/{len(campaign_batch)} recent flows flagged.")
+
+        # Real ML feature importance extraction
+        importances = clf.feature_importances_
+        top_indices = np.argsort(importances)[::-1][:3]
+
+        print("\n[*] Explainability Engine - Top Contributing Features:")
+        malicious_matrix = np.array(malicious_flows)
+        
+        for idx in top_indices:
+            feat_name = FEATURES[idx]
+            feat_weight = importances[idx] * 100
+            # Show the actual average value seen during the attack
+            avg_val = np.mean(malicious_matrix[:, idx]) if len(malicious_matrix) > 0 else 0
+            print(f"    - {feat_name}: {avg_val:,.2f} (Model Weight: {feat_weight:.1f}%)")
+    else:
+        print("\033[92m[+] Traffic volume normal. No sustained campaigns detected.\033[0m")
+    print(f"{'='*60}\n")
+    time.sleep(1)
+
+# ── EXECUTION SUITE ──────────────────────────────────────────────
 if __name__ == "__main__":
+    # Simulate realistic sequential attack campaigns
+    simulate_attack_campaign("Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv", "PortScan")
+    simulate_attack_campaign("Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv", "DDoS")
+    simulate_attack_campaign("Tuesday-WorkingHours.pcap_ISCX.csv", "FTP-Patator")
+    simulate_attack_campaign("Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv", "Infiltration")
     
-    # Scenario 1: Normal Traffic Baseline
-    row_benign = get_traffic_sample("Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv", "BENIGN")
-    analyze_traffic(row_benign, "SCENARIO 1: NORMAL TRAFFIC BASELINE")
-    time.sleep(2)
-    
-    # Scenario 2: Reconnaissance / Port Scan
-    row_portscan = get_traffic_sample("Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv", "PortScan")
-    analyze_traffic(row_portscan, "SCENARIO 2: RECONNAISSANCE (PORT SCAN)")
-    time.sleep(2)
-
-    # Scenario 3: Denial of Service
-    row_ddos = get_traffic_sample("Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv", "DDoS")
-    analyze_traffic(row_ddos, "SCENARIO 3: DENIAL OF SERVICE (DDoS)")
-    time.sleep(2)
-
-    # Scenario 4: Additional Attack (Brute Force)
-    row_bruteforce = get_traffic_sample("Tuesday-WorkingHours.pcap_ISCX.csv", "FTP-Patator")
-    analyze_traffic(row_bruteforce, "SCENARIO 4: BRUTE FORCE (FTP-PATATOR)")
-    time.sleep(2)
-
-    # Scenario 5: Ambiguous / Missed Case (Infiltration)
-    row_infiltration = get_traffic_sample("Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv", "Infiltration")
-    analyze_traffic(row_infiltration, "SCENARIO 5: AMBIGUOUS CASE (INFILTRATION / LATERAL MOVEMENT)")
-    
-    print("\n[*] Demonstration Complete.")
+    print("\n[*] Demonstration Suite Complete.")

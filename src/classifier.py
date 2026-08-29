@@ -1,101 +1,119 @@
-import pandas as pd
-import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
-from sklearn.preprocessing import LabelEncoder
-import joblib
 import os
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
 
-# ── CONFIGURATION ────────────────────────────────────────────────
-CSV_PATH = "E:/rawlogs/MachineLearningCSV/MachineLearningCVE/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv"
+# ── CONFIGURATION & CONSTANTS ────────────────────────────────────
+DATASET_PATH = "datasets/MachineLearningCVE/combined_traffic.csv"
+MODEL_DIR = "models"
 
-# Exact features extracted by your data_loader.py
+# 14 features matching the saved model specification
 FEATURES = [
+    "Destination Port",
     "Flow Duration",
     "Total Fwd Packets",
     "Total Backward Packets",
+    "Total Length of Fwd Packets",
+    "Total Length of Bwd Packets",
     "Flow Bytes/s",
-    "Fwd Packets/s",
-    "Packet Length Mean"
+    "Flow Packets/s",
+    "Packet Length Mean",
+    "Average Packet Size",
+    "SYN Flag Count",
+    "ACK Flag Count",
+    "PSH Flag Count",
+    "RST Flag Count",
 ]
 
-def clean_dataset(df):
-    """Handles infinite and NaN values common in CIC-IDS-2017."""
+
+def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    """Strips column whitespace and cleans invalid numeric values."""
+    df.columns = df.columns.str.strip()
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
     return df
 
+
 def train_model():
-    print(f"[*] Loading dataset from {CSV_PATH}...")
-    df = pd.read_csv(CSV_PATH)
-    
-    # Strip whitespace from column names (critical for CIC-IDS-2017)
-    df.columns = df.columns.str.strip()
-    
-    print("[*] Sanitizing data...")
+    print("[*] Loading dataset...")
+    if not os.path.exists(DATASET_PATH):
+        print(f"[!] Error: Dataset not found at {DATASET_PATH}")
+        print(
+            "    Run 'python src/merge_datasets.py' first to generate combined_traffic.csv"
+        )
+        return
+
+    df = pd.read_csv(DATASET_PATH, low_memory=False)
+
+    print("[*] Sanitizing dataset (stripping whitespace, removing NaNs/Infs)...")
     df = clean_dataset(df)
-    
+
+    # Check for missing feature columns
+    missing_cols = [col for col in FEATURES if col not in df.columns]
+    if missing_cols:
+        print(f"[!] Error: Dataset is missing required columns: {missing_cols}")
+        return
+
     X = df[FEATURES]
-    y = df["Label"]
-    
-    # Encode text labels into integers for the model
+    y = df["Label"].astype(str).str.strip()
+
+    print(f"[*] Total valid flows loaded: {len(df):,}")
+    print(f"[*] Distinct target classes ({len(y.unique())}): {list(y.unique())}")
+
+    print("[*] Encoding target labels...")
     le = LabelEncoder()
     y_encoded = le.fit_transform(y)
-    
-    print("[*] Splitting data into 70% Training and 30% Testing...")
-    X_train, X_test, y_train, y_test = train_test_split(X, y_encoded, test_size=0.3, random_state=42)
-    
-    print("[*] Training Random Forest Classifier (this may take a minute)...")
-    clf = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
-    clf.fit(X_train, y_train)
-    
-    print("\n" + "="*50)
-    print("  MODEL EVALUATION METRICS (For Technical Report)")
-    print("="*50)
-    y_pred = clf.predict(X_test)
-    print(classification_report(y_test, y_pred, target_names=le.classes_))
-    
-    print("\n" + "="*50)
-    print("  FEATURE IMPORTANCE (For Explainability Requirement)")
-    print("="*50)
-    importances = clf.feature_importances_
-    for feature, importance in sorted(zip(FEATURES, importances), key=lambda x: x[1], reverse=True):
-        print(f"{feature:>25}: {importance:.4f}")
-        
-    print("\n[*] Exporting model and encoder for dataset_uploader.py...")
-    joblib.dump(clf, "attack_classifier.pkl")
-    joblib.dump(le, "label_encoder.pkl")
-    print("[+] Export complete. System is ready.")
 
-def predict_attack(raw_row):
-    """
-    Called dynamically by dataset_uploader.py to classify live/uploaded data.
-    Takes a dictionary of network metrics, returns (Attack Label, Confidence %).
-    """
-    if not os.path.exists("attack_classifier.pkl"):
-        raise FileNotFoundError("Model not trained. Run classifier.py first.")
-        
-    clf = joblib.load("attack_classifier.pkl")
-    le = joblib.load("label_encoder.pkl")
-    
-    # Extract only the features the model was trained on
-    clean_raw = {str(k).strip().lower(): v for k, v in raw_row.items()}
-    
-    feature_vector = []
-    for feature in FEATURES:
-        # Match incoming dict keys (case-insensitive) to required features
-        val = clean_raw.get(feature.lower(), 0)
-        feature_vector.append(float(val) if val not in ["inf", "Inf", "nan", None] else 0.0)
-        
-    # Predict
-    pred_idx = clf.predict([feature_vector])[0]
-    probabilities = clf.predict_proba([feature_vector])[0]
-    
-    confidence = round(probabilities[pred_idx] * 100, 2)
-    predicted_label = le.inverse_transform([pred_idx])[0]
-    
-    return predicted_label, confidence
+    print("[*] Splitting dataset (70% Training / 30% Testing)...")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y_encoded, test_size=0.3, random_state=42, stratify=y_encoded
+    )
+
+    print(
+        "[*] Training Random Forest Classifier (n_estimators=100, max_depth=20, class_weight='balanced_subsample')..."
+    )
+    clf = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=20,
+        class_weight="balanced_subsample",
+        random_state=42,
+        n_jobs=-1,
+    )
+    clf.fit(X_train, y_train)
+
+    print("[*] Evaluating model on unseen holdout test set (30%)...")
+    y_pred = clf.predict(X_test)
+
+    accuracy = accuracy_score(y_test, y_pred)
+    report = classification_report(
+        y_test, y_pred, target_names=le.classes_, digits=4, zero_division=0
+    )
+
+    print("\n" + "=" * 60)
+    print(f"MODEL ACCURACY: {accuracy * 100:.2f}%")
+    print("=" * 60)
+    print(report)
+
+    # Persist evaluation metrics for technical report verification
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    metrics_path = os.path.join(MODEL_DIR, "evaluation_metrics.txt")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        f.write(f"Overall Accuracy: {accuracy * 100:.4f}%\n\n")
+        f.write("Classification Report:\n")
+        f.write(report)
+    print(f"[+] Saved evaluation metrics to {metrics_path}")
+
+    # Export synchronized model artifacts
+    print(f"[*] Saving model artifacts into '{MODEL_DIR}/'...")
+    joblib.dump(clf, os.path.join(MODEL_DIR, "attack_classifier.pkl"))
+    joblib.dump(le, os.path.join(MODEL_DIR, "label_encoder.pkl"))
+    joblib.dump(FEATURES, os.path.join(MODEL_DIR, "feature_names.pkl"))
+    print("[+] Training complete. Pipeline artifacts are fully synchronized.")
+
 
 if __name__ == "__main__":
     train_model()

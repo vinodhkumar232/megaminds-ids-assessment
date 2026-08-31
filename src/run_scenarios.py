@@ -9,7 +9,8 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ── CONFIGURATION & RELATIVE PATHS ──────────────────────────────
-MODEL_PATH = "models/attack_classifier.pkl"
+RF_MODEL_PATH = "models/attack_classifier.pkl"
+IF_MODEL_PATH = "models/anomaly_detector.pkl"
 ENCODER_PATH = "models/label_encoder.pkl"
 DATA_DIR = "datasets/MachineLearningCVE"
 
@@ -21,26 +22,28 @@ FEATURES = [
     "ACK Flag Count", "PSH Flag Count", "RST Flag Count",
 ]
 
-print("[*] Initializing AI-Driven Intrusion Detection Pipeline...")
-if not os.path.exists(MODEL_PATH) or not os.path.exists(ENCODER_PATH):
-    print(f"[!] ERROR: Model artifacts not found in 'models/'.")
+print("[*] Initializing Hybrid AI-Driven Intrusion Detection Pipeline...")
+if not all(os.path.exists(p) for p in [RF_MODEL_PATH, IF_MODEL_PATH, ENCODER_PATH]):
+    print(f"[!] ERROR: Model artifacts not found. Run classifier.py first.")
     exit(1)
 
-clf = joblib.load(MODEL_PATH)
+clf = joblib.load(RF_MODEL_PATH)
+iso_forest = joblib.load(IF_MODEL_PATH)
 le = joblib.load(ENCODER_PATH)
 
-def simulate_attack_campaign(filename: str, target_label: str, batch_size: int = 25):
-    print(f"\n{'=' * 70}")
-    print(f"SCENARIO: {target_label.upper()} CAMPAIGN DETECTION")
-    print(f"{'=' * 70}")
+def run_blind_inference_scenario(filename: str, target_label: str, window_size: int = 30):
+    print(f"\n{'=' * 90}")
+    print(f"SCENARIO: BLIND INFERENCE STREAM ({target_label.upper()} ENVIRONMENT)")
+    print(f"{'=' * 90}")
 
     filepath = os.path.join(DATA_DIR, filename)
     if not os.path.exists(filepath):
         print(f"[-] Error: File not found: {filepath}")
         return
 
-    print(f"[*] Scanning {filename} for {target_label} campaign...")
+    print(f"[*] Fast-forwarding stream to active threat window for demonstration...")
 
+    # Fast-forward buffer to find a mixed window of benign and attack traffic
     history = deque(maxlen=5)
     campaign_batch = []
     found_attack = False
@@ -63,37 +66,49 @@ def simulate_attack_campaign(filename: str, target_label: str, batch_size: int =
                         history.append(row)
                 else:
                     campaign_batch.append(row)
-                    if len(campaign_batch) >= batch_size:
+                    if len(campaign_batch) >= window_size:
                         break
 
-            if len(campaign_batch) >= batch_size:
+            if len(campaign_batch) >= window_size:
                 break
     except Exception as e:
         print(f"[-] Error parsing {filename}: {e}")
         return
 
-    if not found_attack or len(campaign_batch) == 0:
+    if len(campaign_batch) == 0:
         return
 
-    print(f"[*] Ingesting network interface stream ({len(campaign_batch)} sequential flows)...\n")
+    print(f"[*] Ingesting {len(campaign_batch)} blind flows. Ground truth hidden from models...\n")
     time.sleep(1)
 
     threat_count = 0
     malicious_flows = []
 
+    # Print Table Header
+    print(f"{'PREDICTION':<25} | {'CONFIDENCE':<10} | {'BEHAVIORAL BASELINE':<20} || {'ACTUAL GROUND TRUTH'}")
+    print("-" * 90)
+
     for i, row in enumerate(campaign_batch):
+        # 1. Extract true label (hidden from engine)
+        actual_label = str(row.get("Label", "")).strip()
+        
+        # 2. Extract strictly the 14 features
         feature_vector = []
         for f in FEATURES:
-            val = row.get(f, row.get(f.strip(), 0.0))
             try:
-                val = float(val)
+                val = float(row.get(f, row.get(f.strip(), 0.0)))
             except (ValueError, TypeError):
                 val = 0.0
             feature_vector.append(val)
 
         feature_df = pd.DataFrame([feature_vector], columns=FEATURES)
         
-        # ── PRIORITY 2 FIX: True Confidence Scoring ──
+        # ── HYBRID ENGINE LOGIC ──
+        # A. Unsupervised Anomaly Detection (Isolation Forest)
+        if_pred = iso_forest.predict(feature_df)[0]
+        baseline_status = "NORMAL" if if_pred == 1 else "ANOMALY DEVIATION"
+
+        # B. Supervised Signature Classification (Random Forest)
         probabilities = clf.predict_proba(feature_df)[0]
         pred_idx = np.argmax(probabilities)
         confidence = probabilities[pred_idx] * 100
@@ -101,27 +116,27 @@ def simulate_attack_campaign(filename: str, target_label: str, batch_size: int =
 
         time.sleep(0.05) 
 
-        if pred_label == 'BENIGN':
-            print(f"  [+] Flow {i+1:02d}: OK (Benign) | Conf: {confidence:.1f}%")
+        # Format the output to show Prediction vs Actual
+        if pred_label == 'BENIGN' and baseline_status == 'NORMAL':
+            print(f"  \033[92m{pred_label:<23}\033[0m | {confidence:>5.1f}%     | {baseline_status:<18} || {actual_label}")
         else:
-            # Only flag as high severity if confidence is above a threshold
-            severity = "HIGH" if confidence > 85.0 else "UNCERTAIN"
-            color = "\033[91m" if severity == "HIGH" else "\033[93m"
-            print(f"  {color}[!] Flow {i+1:02d}: {pred_label} detected | Sev: {severity} | Conf: {confidence:.1f}%\033[0m")
-            
             threat_count += 1
             malicious_flows.append(feature_vector)
+            
+            # Dynamic severity logic
+            sev_color = "\033[93m" if confidence < 85.0 else "\033[91m"
+                
+            print(f"  {sev_color}{pred_label:<23}\033[0m | {sev_color}{confidence:>5.1f}%\033[0m     | {sev_color}{baseline_status:<18}\033[0m || {actual_label}")
 
-    print(f"\n{'='*70}")
+    print(f"\n{'='*90}")
     
-    # ── PRIORITY 4 FIX: Mathematical Threshold Justification ──
+    # ── CAMPAIGN THRESHOLD & EXPLAINABILITY ──
     alert_threshold = len(campaign_batch) * 0.30 
     
     if threat_count > alert_threshold:
-        print(f"\033[91m[!!!] CRITICAL ALERT: SUSTAINED {target_label.upper()} CAMPAIGN DETECTED\033[0m")
-        print(f"[*] Volume: {threat_count}/{len(campaign_batch)} recent flows flagged.")
+        print(f"\033[91m[!!!] CRITICAL ALERT: SUSTAINED CAMPAIGN DETECTED\033[0m")
+        print(f"[*] Volume: {threat_count}/{len(campaign_batch)} flows deviated from normal baseline.")
 
-        # Aggregated Explainability without SHAP dependencies
         print("\n[*] Explainability Engine - Campaign Feature Aggregation:")
         importances = clf.feature_importances_
         top_indices = np.argsort(importances)[::-1][:3]
@@ -131,15 +146,15 @@ def simulate_attack_campaign(filename: str, target_label: str, batch_size: int =
             feat_name = FEATURES[idx]
             feat_weight = importances[idx] * 100
             avg_val = np.mean(malicious_matrix[:, idx]) if len(malicious_matrix) > 0 else 0
-            print(f"    - {feat_name}: {avg_val:,.2f} (Model Weight: {feat_weight:.1f}%)")
+            print(f"    - {feat_name}: {avg_val:,.2f} (RF Model Weight: {feat_weight:.1f}%)")
     else:
         print("\033[92m[+] Traffic volume normal. No sustained campaigns detected.\033[0m")
-    print(f"{'='*70}\n")
+    print(f"{'='*90}\n")
     time.sleep(1)
 
 if __name__ == "__main__":
-    simulate_attack_campaign("Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv", "PortScan")
-    simulate_attack_campaign("Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv", "DDoS")
-    simulate_attack_campaign("Tuesday-WorkingHours.pcap_ISCX.csv", "FTP-Patator")
-    simulate_attack_campaign("Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv", "Infiltration")
-    print("\n[*] Demonstration Suite Complete.")
+    run_blind_inference_scenario("Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv", "PortScan")
+    run_blind_inference_scenario("Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv", "DDoS")
+    run_blind_inference_scenario("Tuesday-WorkingHours.pcap_ISCX.csv", "FTP-Patator")
+    run_blind_inference_scenario("Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv", "Infiltration")
+    print("\n[*] Hybrid Engine Demonstration Suite Complete.")
